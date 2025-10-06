@@ -1,0 +1,77 @@
+name: Verify Committer
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify-committer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get pusher info
+        id: pusher
+        run: |
+          PUSHER_LOGIN="${{ github.actor }}"
+          PUSHER_EMAIL=$(gh api /users/$PUSHER_LOGIN --jq '.email // empty')
+          
+          # Si no hay email público, usar el email del evento
+          if [ -z "$PUSHER_EMAIL" ]; then
+            PUSHER_EMAIL="${{ github.event.pusher.email }}"
+          fi
+          
+          echo "pusher_email=$PUSHER_EMAIL" >> $GITHUB_OUTPUT
+          echo "pusher_login=$PUSHER_LOGIN" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Verify commits
+        run: |
+          PUSHER_EMAIL="${{ steps.pusher.outputs.pusher_email }}"
+          PUSHER_LOGIN="${{ steps.pusher.outputs.pusher_login }}"
+          
+          echo "Verifying commits for pusher: $PUSHER_LOGIN ($PUSHER_EMAIL)"
+          
+          # Obtener el rango de commits a verificar
+          if [ "${{ github.event_name }}" == "push" ]; then
+            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              # Primer push a la rama
+              COMMIT_RANGE="${{ github.sha }}"
+            else
+              COMMIT_RANGE="${{ github.event.before }}..${{ github.sha }}"
+            fi
+          else
+            # Para pull requests
+            COMMIT_RANGE="origin/${{ github.base_ref }}..${{ github.sha }}"
+          fi
+          
+          echo "Checking commit range: $COMMIT_RANGE"
+          
+          # Verificar cada commit
+          for commit in $(git rev-list $COMMIT_RANGE 2>/dev/null || echo "${{ github.sha }}"); do
+            COMMIT_AUTHOR_EMAIL=$(git show -s --format='%ae' $commit)
+            COMMIT_COMMITTER_EMAIL=$(git show -s --format='%ce' $commit)
+            COMMIT_MESSAGE=$(git show -s --format='%s' $commit)
+            
+            echo "Checking commit $commit:"
+            echo "  Message: $COMMIT_MESSAGE"
+            echo "  Author: $COMMIT_AUTHOR_EMAIL"
+            echo "  Committer: $COMMIT_COMMITTER_EMAIL"
+            echo "  Pusher: $PUSHER_EMAIL"
+            
+            # Verificar que el committer sea el mismo que el pusher
+            if [ "$COMMIT_COMMITTER_EMAIL" != "$PUSHER_EMAIL" ] && [ -n "$PUSHER_EMAIL" ]; then
+              echo "❌ ERROR: Commit $commit was not committed by pusher"
+              echo "  Committer: $COMMIT_COMMITTER_EMAIL"
+              echo "  Pusher: $PUSHER_EMAIL"
+              exit 1
+            fi
+            
+            echo "✅ Commit $commit verified"
+          done
+          
+          echo "🎉 All commits verified successfully!"
