@@ -13,6 +13,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
       
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+      
       - name: Get pusher info
         id: pusher
         run: |
@@ -30,23 +35,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Verify commits
+        id: verify
         run: |
           PUSHER_EMAIL="${{ steps.pusher.outputs.pusher_email }}"
           PUSHER_LOGIN="${{ steps.pusher.outputs.pusher_login }}"
+          VERIFICATION_FAILED=false
           
           echo "Verifying commits for pusher: $PUSHER_LOGIN ($PUSHER_EMAIL)"
           
+          # Solo verificar en push events, no en pull requests
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Skipping verification for pull request"
+            exit 0
+          fi
+          
           # Obtener el rango de commits a verificar
-          if [ "${{ github.event_name }}" == "push" ]; then
-            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
-              # Primer push a la rama
-              COMMIT_RANGE="${{ github.sha }}"
-            else
-              COMMIT_RANGE="${{ github.event.before }}..${{ github.sha }}"
-            fi
+          if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+            # Primer push a la rama
+            COMMIT_RANGE="${{ github.sha }}"
           else
-            # Para pull requests
-            COMMIT_RANGE="origin/${{ github.base_ref }}..${{ github.sha }}"
+            COMMIT_RANGE="${{ github.event.before }}..${{ github.sha }}"
           fi
           
           echo "Checking commit range: $COMMIT_RANGE"
@@ -68,10 +76,72 @@ jobs:
               echo "❌ ERROR: Commit $commit was not committed by pusher"
               echo "  Committer: $COMMIT_COMMITTER_EMAIL"
               echo "  Pusher: $PUSHER_EMAIL"
-              exit 1
+              VERIFICATION_FAILED=true
+            else
+              echo "✅ Commit $commit verified"
             fi
-            
-            echo "✅ Commit $commit verified"
           done
           
-          echo "🎉 All commits verified successfully!"
+          if [ "$VERIFICATION_FAILED" = true ]; then
+            echo "verification_failed=true" >> $GITHUB_OUTPUT
+            exit 0  # No fallar aquí, lo haremos en el siguiente step
+          else
+            echo "🎉 All commits verified successfully!"
+            echo "verification_failed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Revert commits if verification failed
+        if: steps.verify.outputs.verification_failed == 'true' && github.event_name == 'push'
+        run: |
+          echo "🔄 Verification failed. Reverting commits..."
+          
+          # Obtener información del push
+          BRANCH_NAME="${{ github.ref_name }}"
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+          
+          echo "Branch: $BRANCH_NAME"
+          echo "Reverting from $AFTER_SHA to $BEFORE_SHA"
+          
+          # Verificar que no sea el primer commit
+          if [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            # Revertir al commit anterior
+            echo "Resetting to previous commit: $BEFORE_SHA"
+            git reset --hard $BEFORE_SHA
+            
+            # Forzar el push para revertir
+            git push --force-with-lease origin $BRANCH_NAME
+            
+            echo "✅ Commits reverted successfully"
+          else
+            echo "⚠️ Cannot revert first commit to branch. Deleting branch instead."
+            git push origin --delete $BRANCH_NAME || echo "Could not delete branch"
+          fi
+          
+          # Crear un issue para notificar el problema
+          gh issue create \
+            --title "🚨 Commit Verification Failed - Auto Reverted" \
+            --body "**Verification failed for commits in branch \`$BRANCH_NAME\`**
+
+          **Details:**
+          - Pusher: ${{ github.actor }}
+          - Commits: \`$BEFORE_SHA..$AFTER_SHA\`
+          - Reason: Committer email does not match pusher email
+          
+          **Action taken:** Commits have been automatically reverted.
+          
+          Please ensure your Git email configuration matches your GitHub account:
+          \`\`\`bash
+          git config user.email \"your-github-email@example.com\"
+          \`\`\`
+          
+          Then recommit your changes with the correct email." \
+            --assignee ${{ github.actor }} || echo "Could not create issue"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Fail workflow if verification failed
+        if: steps.verify.outputs.verification_failed == 'true'
+        run: |
+          echo "❌ Workflow failed due to commit verification failure"
+          exit 1
